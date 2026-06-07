@@ -1,0 +1,46 @@
+# === Python (Compilados e Cache) ===
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+htmlcov/
+.tox/
+.coverage
+.cache
+.pytest_cache/
+.mypy_cache/
+
+# === Ambientes Virtuais (Virtual Environments) ===
+.venv/
+venv/
+ENV/
+env/
+育env/
+
+# === Configurações de IDEs e Editores ===
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# === Ficheiros do Sistema Operativo ===
+.DS_Store
+Thumbs.db
+
+# === Logs e Dados Temporários ===
+*.log
+pip-log.txt
+*.bak
+
+# === Outputs Locais do Projeto Voxel ===
+# (Opcional: descomenta se não quiseres subir testes locais para o GitHub)
+# *.vox
+# *.obj
+# *.glb
+# *.mtl
+# *.png
+# *.fbx
