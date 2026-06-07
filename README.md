@@ -92,8 +92,8 @@ TRIANGULATE = False   # False = quads   |  True  = triangles
 |---|---|---|
 | `VOXEL_SIZE` | `1.0` | Unreal Engine 5 (centimeters) |
 | `VOXEL_SIZE` | `0.01` | O3DE (meters) |
-| `TRIANGULATE` | `False` | Blender (preserves loop cuts) |
-| `TRIANGULATE` | `True` | Maximum engine compatibility |
+| `TRIANGULATE` | `False` | Export quads — better for editing in Blender |
+| `TRIANGULATE` | `True` | Export triangles — maximum engine compatibility |
 
 ---
 
