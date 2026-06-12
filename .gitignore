@@ -44,3 +44,8 @@ pip-log.txt
 # *.mtl
 # *.png
 # *.fbx
+
+# === Outputs de Build e Arquivos Compactados ===
+build/
+*.rar
+*.zip

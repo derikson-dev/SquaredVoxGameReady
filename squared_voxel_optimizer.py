@@ -1,0 +1,595 @@
+bl_info = {
+    "name": "SquaredVoxelOptimizer",
+    "author": "Derikson",
+    "version": (1, 1, 0),
+    "blender": (5, 1, 0),
+    "location": "View3D > Sidebar > Sqrd Voxel Optimizer",
+    "description": "Pipeline monolítico VOX -> Greedy Mesh -> Bake -> FBX. Otimizado para Bevy 0.18.",
+    "category": "Import-Export",
+}
+
+import bpy
+import struct
+import zlib
+import math
+import os
+from pathlib import Path
+from collections import defaultdict
+
+# ==============================================================================
+# DOMAIN 1: EXTENSÕES C E FALLBACKS
+# ==============================================================================
+try:
+    import greedy_mesher_ext as _EXT
+    BACKEND = 'c_ext'
+except ImportError:
+    BACKEND = 'python'
+
+try:
+    import tjunction_resolver as _TJ_C
+    _HAS_TJ_C = True
+except ImportError:
+    _HAS_TJ_C = False
+
+# ==============================================================================
+# DOMAIN 2: VOX PARSING E ESTRUTURAS
+# ==============================================================================
+_DEFAULT_PALETTE_RGBA = [
+    0x00000000,0xffffffff,0xffccffff,0xff99ffff,0xff66ffff,0xff33ffff,
+    0xff00ffff,0xffffccff,0xffccccff,0xff99ccff,0xff66ccff,0xff33ccff,
+    0xff00ccff,0xffff99ff,0xffcc99ff,0xff9999ff,0xff6699ff,0xff3399ff,
+    0xff0099ff,0xffff66ff,0xffcc66ff,0xff9966ff,0xff6666ff,0xff3366ff,
+    0xff0066ff,0xffff33ff,0xffcc33ff,0xff9933ff,0xff6633ff,0xff3333ff,
+    0xff0033ff,0xffff00ff,0xffcc00ff,0xff9900ff,0xff6600ff,0xff3300ff,
+    0xff0000ff,0xffffffcc,0xffccffcc,0xff99ffcc,0xff66ffcc,0xff33ffcc,
+    0xff00ffcc,0xffffcccc,0xffcccccc,0xff99cccc,0xff66cccc,0xff33cccc,
+    0xff00cccc,0xffff99cc,0xffcc99cc,0xff9999cc,0xff6699cc,0xff3399cc,
+    0xff0099cc,0xffff66cc,0xffcc66cc,0xff9966cc,0xff6666cc,0xff3366cc,
+    0xff0066cc,0xffff33cc,0xffcc33cc,0xff9933cc,0xff6633cc,0xff3333cc,
+    0xff0033cc,0xffff00cc,0xffcc00cc,0xff9900cc,0xff6600cc,0xff3300cc,
+    0xff0000cc,0xffffff99,0xffccff99,0xff99ff99,0xff66ff99,0xff33ff99,
+    0xff00ff99,0xffffcc99,0xffcccc99,0xff99cc99,0xff66cc99,0xff33cc99,
+    0xff00cc99,0xffff9999,0xffcc9999,0xff999999,0xff669999,0xff339999,
+    0xff009999,0xffff6699,0xffcc6699,0xff996699,0xff666699,0xff336699,
+    0xff006699,0xffff3399,0xffcc3399,0xff993399,0xff663399,0xff333399,
+    0xff003399,0xffff0099,0xffcc0099,0xff990099,0xff660099,0xff330099,
+    0xff000099,0xffffff66,0xffccff66,0xff99ff66,0xff66ff66,0xff33ff66,
+    0xff00ff66,0xffffcc66,0xffcccc66,0xff99cc66,0xff66cc66,0xff33cc66,
+    0xff00cc66,0xffff9966,0xffcc9966,0xff999966,0xff669966,0xff339966,
+    0xff009966,0xffff6666,0xffcc6666,0xff996666,0xff666666,0xff336666,
+    0xff006666,0xffff3366,0xffcc3366,0xff993366,0xff663366,0xff333366,
+    0xff003366,0xffff0066,0xffcc0066,0xff990066,0xff660066,0xff330066,
+    0xff000066,0xffffff33,0xffccff33,0xff99ff33,0xff66ff33,0xff33ff33,
+    0xff00ff33,0xffffcc33,0xffcccc33,0xff99cc33,0xff66cc33,0xff33cc33,
+    0xff00cc33,0xffff9933,0xffcc9933,0xff999933,0xff669933,0xff339933,
+    0xff009933,0xffff6633,0xffcc6633,0xff996633,0xff666633,0xff336633,
+    0xff006633,0xffff3333,0xffcc3333,0xff993333,0xff663333,0xff333333,
+    0xff003333,0xffff0033,0xffcc0033,0xff990033,0xff660033,0xff330033,
+    0xff000033,0xffffff00,0xffccff00,0xff99ff00,0xff66ff00,0xff33ff00,
+    0xff00ff00,0xffffcc00,0xffcccc00,0xff99cc00,0xff66cc00,0xff33cc00,
+    0xff00cc00,0xffff9900,0xffcc9900,0xff999900,0xff669900,0xff339900,
+    0xff009900,0xffff6600,0xffcc6600,0xff996600,0xff666600,0xff336600,
+    0xff006600,0xffff3300,0xffcc3300,0xff993300,0xff663300,0xff333300,
+    0xff003300,0xffff0000,0xffcc0000,0xff990000,0xff660000,0xff330000,
+    0xff0000ee,0xff0000dd,0xff0000bb,0xff0000aa,0xff000088,0xff000077,
+    0xff000055,0xff000044,0xff000022,0xff000011,0xff00ee00,0xff00dd00,
+    0xff00bb00,0xff00aa00,0xff008800,0xff007700,0xff005500,0xff004400,
+    0xff002200,0xff001100,0xffee0000,0xffdd0000,0xffbb0000,0xffaa0000,
+    0xff880000,0xff770000,0xff550000,0xff440000,0xff220000,0xff110000,
+    0xffeeeeee,0xffdddddd,0xffbbbbbb,0xffaaaaaa,0xff888888,0xff777777,
+    0xff555555,0xff444444,0xff222222,0xff111111,0xff000000,
+]
+
+def build_default_palette():
+    result = []
+    for rgba in _DEFAULT_PALETTE_RGBA:
+        r=(rgba>>0)&0xFF; g=(rgba>>8)&0xFF; b=(rgba>>16)&0xFF; a=(rgba>>24)&0xFF
+        result.append((r,g,b,a))
+    while len(result) < 256:
+        result.append((0,0,0,255))
+    return result
+
+class VoxObject:
+    def __init__(self, name, size, voxels, offset=(0,0,0)):
+        self.name   = name
+        self.size   = size
+        self.voxels = voxels
+        self.offset = offset
+
+class VoxScene:
+    def __init__(self):
+        self.objects = []
+        self.palette = []
+
+def _read_dict(data, pos):
+    n = struct.unpack_from('<i', data, pos)[0]; pos += 4
+    d = {}
+    for _ in range(n):
+        klen = struct.unpack_from('<i', data, pos)[0]; pos += 4
+        key  = data[pos:pos+klen].decode('utf-8', errors='replace'); pos += klen
+        vlen = struct.unpack_from('<i', data, pos)[0]; pos += 4
+        val  = data[pos:pos+vlen].decode('utf-8', errors='replace'); pos += vlen
+        d[key] = val
+    return d, pos
+
+def _decode_rotation(r_byte):
+    idx0=(r_byte)&0x3; idx1=(r_byte>>2)&0x3
+    s0=-1 if (r_byte>>4)&1 else 1
+    s1=-1 if (r_byte>>5)&1 else 1
+    s2=-1 if (r_byte>>6)&1 else 1
+    idx2=3-idx0-idx1
+    row0=[0,0,0]; row0[idx0]=s0
+    row1=[0,0,0]; row1[idx1]=s1
+    row2=[0,0,0]; row2[idx2]=s2
+    return [row0,row1,row2]
+
+def _apply_transform(rot, tx, ty, tz, vx, vy, vz, sx, sy, sz):
+    cx,cy,cz = sx//2, sy//2, sz//2
+    lx,ly,lz = vx-cx, vy-cy, vz-cz
+    rx = rot[0][0]*lx + rot[0][1]*ly + rot[0][2]*lz
+    ry = rot[1][0]*lx + rot[1][1]*ly + rot[1][2]*lz
+    rz = rot[2][0]*lx + rot[2][1]*ly + rot[2][2]*lz
+    return rx+tx, ry+ty, rz+tz
+
+def parse_vox_file(filepath):
+    data = Path(filepath).read_bytes()
+    if data[:4] != b'VOX ':
+        raise ValueError(f'Arquivo corrompido ou formato inválido: {filepath}')
+
+    offset = 8
+    main_content_sz  = struct.unpack_from('<I', data, offset+4)[0]
+    main_children_sz = struct.unpack_from('<I', data, offset+8)[0]
+    pos = offset + 12 + main_content_sz
+    end = pos + main_children_sz
+
+    raw_models = []
+    nodes      = {}
+    palette    = None
+
+    while pos < end:
+        cid  = data[pos:pos+4].decode('ascii')
+        csz  = struct.unpack_from('<I', data, pos+4)[0]
+        cdat = data[pos+12:pos+12+csz]
+
+        if cid == 'SIZE':
+            sx,sy,sz = struct.unpack_from('<III', cdat, 0)
+            raw_models.append({'size':(sx,sy,sz), 'voxels':[]})
+        elif cid == 'XYZI':
+            n_vox = struct.unpack_from('<i', cdat, 0)[0]
+            voxels = [(cdat[4+i*4],cdat[4+i*4+1],cdat[4+i*4+2],cdat[4+i*4+3]) for i in range(n_vox)]
+            if raw_models:
+                raw_models[-1]['voxels'] = voxels
+        elif cid == 'nTRN':
+            p = 0
+            node_id = struct.unpack_from('<i', cdat, p)[0]; p += 4
+            attrs, p = _read_dict(cdat, p)
+            child_id = struct.unpack_from('<i', cdat, p)[0]; p += 4
+            p += 4
+            layer_id = struct.unpack_from('<i', cdat, p)[0]; p += 4
+            num_frames = struct.unpack_from('<i', cdat, p)[0]; p += 4
+            frame, p = _read_dict(cdat, p)
+            tx=ty=tz=0
+            if '_t' in frame:
+                parts=frame['_t'].split(); tx,ty,tz=int(parts[0]),int(parts[1]),int(parts[2])
+            rot=[[1,0,0],[0,1,0],[0,0,1]]
+            if '_r' in frame:
+                rot=_decode_rotation(int(frame['_r']))
+            nodes[node_id]={'type':'TRN','child':child_id, 'tx':tx,'ty':ty,'tz':tz,'rot':rot, 'name':attrs.get('_name','')}
+        elif cid == 'nGRP':
+            p=0
+            node_id=struct.unpack_from('<i', cdat, p)[0]; p+=4
+            _,p=_read_dict(cdat,p)
+            n_ch=struct.unpack_from('<i', cdat, p)[0]; p+=4
+            children=[struct.unpack_from('<i',cdat,p+i*4)[0] for i in range(n_ch)]
+            nodes[node_id]={'type':'GRP','children':children}
+        elif cid == 'nSHP':
+            p=0
+            node_id=struct.unpack_from('<i', cdat, p)[0]; p+=4
+            _,p=_read_dict(cdat,p)
+            n_models=struct.unpack_from('<i', cdat, p)[0]; p+=4
+            model_id=struct.unpack_from('<i', cdat, p)[0]
+            nodes[node_id]={'type':'SHP','model_id':model_id}
+        elif cid == 'RGBA':
+            palette=[(cdat[i*4],cdat[i*4+1],cdat[i*4+2],cdat[i*4+3]) for i in range(256)]
+        
+        pos += 12 + csz
+
+    if palette is None:
+        palette = build_default_palette()
+
+    scene = VoxScene()
+    scene.palette = palette
+
+    if not nodes or not raw_models:
+        for i, m in enumerate(raw_models):
+            scene.objects.append(VoxObject(f'VoxObject_{i}', m['size'], m['voxels']))
+        return scene
+
+    obj_idx = [0]
+    def traverse(node_id, acc_rot, acc_tx, acc_ty, acc_tz):
+        if node_id not in nodes: return
+        node = nodes[node_id]
+        if node['type'] == 'TRN':
+            lr = node['rot']
+            new_rot = [[sum(acc_rot[i][k]*lr[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+            lt = (node['tx'], node['ty'], node['tz'])
+            rt = tuple(sum(acc_rot[i][k]*lt[k] for k in range(3)) for i in range(3))
+            traverse(node['child'], new_rot, acc_tx+rt[0], acc_ty+rt[1], acc_tz+rt[2])
+        elif node['type'] == 'GRP':
+            for child_id in node['children']: traverse(child_id, acc_rot, acc_tx, acc_ty, acc_tz)
+        elif node['type'] == 'SHP':
+            mid = node['model_id']
+            if mid >= len(raw_models): return
+            m = raw_models[mid]
+            sx,sy,sz = m['size']
+            global_voxels = []
+            for vx,vy,vz,color in m['voxels']:
+                gx,gy,gz = _apply_transform(acc_rot, acc_tx,acc_ty,acc_tz, vx,vy,vz, sx,sy,sz)
+                global_voxels.append((gx,gy,gz,color))
+            if not global_voxels: return
+            ox = min(v[0] for v in global_voxels)
+            oy = min(v[1] for v in global_voxels)
+            oz = min(v[2] for v in global_voxels)
+            local_voxels = [(gx-ox, gy-oy, gz-oz, c) for gx,gy,gz,c in global_voxels]
+            lx_max = max(v[0] for v in local_voxels)
+            ly_max = max(v[1] for v in local_voxels)
+            lz_max = max(v[2] for v in local_voxels)
+            scene.objects.append(VoxObject(f'Object_{obj_idx[0]}', (lx_max+1, ly_max+1, lz_max+1), local_voxels, (ox,oy,oz)))
+            obj_idx[0] += 1
+
+    root_id  = min(n for n,v in nodes.items() if v['type']=='TRN')
+    traverse(root_id, [[1,0,0],[0,1,0],[0,0,1]], 0, 0, 0)
+    return scene
+
+# ==============================================================================
+# DOMAIN 3: GREEDY MESHER & T-JUNCTION
+# ==============================================================================
+def _greedy_mesh_plane_python(model, axis, direction):
+    voxels = {(x, y, z): color for x, y, z, color in model.voxels}
+    sx, sy, sz = model.size
+    if axis == "x":
+        size_w, size_u, size_v = sx, sy, sz
+        coord_global  = lambda u, v, w: (w, u, v)
+        coord_vizinho = lambda u, v, w: (w + direction, u, v)
+    elif axis == "y":
+        size_w, size_u, size_v = sy, sx, sz
+        coord_global  = lambda u, v, w: (u, w, v)
+        coord_vizinho = lambda u, v, w: (u, w + direction, v)
+    elif axis == "z":
+        size_w, size_u, size_v = sz, sx, sy
+        coord_global  = lambda u, v, w: (u, v, w)
+        coord_vizinho = lambda u, v, w: (u, v, w + direction)
+    
+    quads = []
+    for w in range(size_w):
+        mask = [[None] * size_v for _ in range(size_u)]
+        for u in range(size_u):
+            for v in range(size_v):
+                pa = coord_global(u, v, w)
+                pv = coord_vizinho(u, v, w)
+                if pa not in voxels or pv in voxels: continue
+                mask[u][v] = voxels[pa]
+        used = [[False] * size_v for _ in range(size_u)]
+        for u in range(size_u):
+            for v in range(size_v):
+                color = mask[u][v]
+                if color is None or used[u][v]: continue
+                width = 1
+                while u + width < size_u and mask[u + width][v] == color and not used[u + width][v]:
+                    width += 1
+                height = 1
+                done = False
+                while v + height < size_v and not done:
+                    for uu in range(u, u + width):
+                        if mask[uu][v + height] != color or used[uu][v + height]: done = True; break
+                    if not done: height += 1
+                for uu in range(u, u + width):
+                    for vv in range(v, v + height): used[uu][vv] = True
+                quads.append((u, v, w, width, height, color))
+    return quads
+
+def greedy_mesh_python_dispatch(model, side):
+    axis, direction = side[0], 1 if side[1] == 'p' else -1
+    return _greedy_mesh_plane_python(model, axis, direction)
+
+def _quad_verts(side, u, v, w, width, height):
+    if side=='xp': return[(w+1,u,v),(w+1,u+width,v),(w+1,u+width,v+height),(w+1,u,v+height)]
+    elif side=='xn': return[(w,u,v+height),(w,u+width,v+height),(w,u+width,v),(w,u,v)]
+    elif side=='yp': return[(u,w+1,v+height),(u+width,w+1,v+height),(u+width,w+1,v),(u,w+1,v)]
+    elif side=='yn': return[(u,w,v),(u+width,w,v),(u+width,w,v+height),(u,w,v+height)]
+    elif side=='zp': return[(u,v,w+1),(u+width,v,w+1),(u+width,v+height,w+1),(u,v+height,w+1)]
+    else:            return[(u,v+height,w),(u+width,v+height,w),(u+width,v,w),(u,v,w)]
+
+def _pt_strictly_between(p, a, b):
+    for i in range(3):
+        if a[i] != b[i]:
+            lo, hi = min(a[i],b[i]), max(a[i],b[i])
+            return all(p[j]==a[j] for j in range(3) if j!=i) and lo<p[i]<hi
+    return False
+
+def _resolver_python(raw_quads):
+    vertex_map = {}; vertices = []
+    def gv(pt):
+        if pt not in vertex_map: vertex_map[pt]=len(vertices)+1; vertices.append(pt)
+        return vertex_map[pt]
+    polygons = [([gv(v) for v in verts], side, color) for verts, side, color in raw_quads]
+    
+    for _ in range(60):
+        em = defaultdict(list)
+        for fi, (vis, _side, _color) in enumerate(polygons):
+            n = len(vis)
+            for i in range(n): em[tuple(sorted([vis[i],vis[(i+1)%n]]))].append((fi, i))
+        open_edges = {e: fl[0] for e, fl in em.items() if len(fl)==1}
+        if not open_edges: break
+        
+        face_tjoints = defaultdict(list)
+        for (ea,eb),(fi,ei) in open_edges.items():
+            va, vb = vertices[ea-1], vertices[eb-1]
+            for vi in range(1, len(vertices)+1):
+                if vi!=ea and vi!=eb and _pt_strictly_between(vertices[vi-1], va, vb):
+                    face_tjoints[fi].append((ea, eb, vi))
+        if not face_tjoints: break
+
+        new_polygons = []
+        for fi, (vis, side, color) in enumerate(polygons):
+            if fi not in face_tjoints:
+                new_polygons.append((vis, side, color)); continue
+            coords = [vertices[vi-1] for vi in vis]
+            fixed_ax = next((ax for ax in range(3) if len(set(c[ax] for c in coords))==1), None)
+            if fixed_ax is None: new_polygons.append((vis, side, color)); continue
+            fixed_val = coords[0][fixed_ax]
+            ax0, ax1 = [i for i in range(3) if i!=fixed_ax]
+            u_vals = sorted(set(c[ax0] for c in coords))
+            v_vals = sorted(set(c[ax1] for c in coords))
+            for ea,eb,t_vi in face_tjoints[fi]:
+                tp = vertices[t_vi-1]
+                u_vals.append(tp[ax0]); v_vals.append(tp[ax1])
+            u_vals = sorted(set(u_vals)); v_vals = sorted(set(v_vals))
+            n = len(coords)
+            area2 = sum(coords[i][ax0]*coords[(i+1)%n][ax1]-coords[(i+1)%n][ax0]*coords[i][ax1] for i in range(n))
+            ccw = area2 > 0
+            u0,u1 = min(c[ax0] for c in coords), max(c[ax0] for c in coords)
+            v0,v1 = min(c[ax1] for c in coords), max(c[ax1] for c in coords)
+            def m3(u,v,_ax0=ax0,_ax1=ax1,_fax=fixed_ax,_fv=fixed_val):
+                p=[0,0,0]; p[_ax0]=u; p[_ax1]=v; p[_fax]=_fv; return tuple(p)
+            for i in range(len(u_vals)-1):
+                for j in range(len(v_vals)-1):
+                    uu0,uu1=u_vals[i],u_vals[i+1]; vv0,vv1=v_vals[j],v_vals[j+1]
+                    if uu0<u0 or uu1>u1 or vv0<v0 or vv1>v1: continue
+                    if ccw: q=[gv(m3(uu0,vv0)),gv(m3(uu1,vv0)),gv(m3(uu1,vv1)),gv(m3(uu0,vv1))]
+                    else:   q=[gv(m3(uu0,vv1)),gv(m3(uu1,vv1)),gv(m3(uu1,vv0)),gv(m3(uu0,vv0))]
+                    new_polygons.append((q, side, color))
+        polygons = new_polygons
+    return vertices, polygons
+
+def build_blender_geometry(vox_obj, voxel_size):
+    sides = ['xp', 'xn', 'yp', 'yn', 'zp', 'zn']
+    raw_quads = []
+    for side in sides:
+        if BACKEND == 'c_ext':
+            quads = getattr(_EXT, f"greedy_mesh_{side}")(vox_obj)
+        else:
+            quads = greedy_mesh_python_dispatch(vox_obj, side)
+        for u,v,w,width,height,color in quads:
+            raw_quads.append((_quad_verts(side,u,v,w,width,height), side, color))
+            
+    if _HAS_TJ_C:
+        vertices, polygons = _TJ_C.resolve_tjunctions(raw_quads)
+    else:
+        vertices, polygons = _resolver_python(raw_quads)
+        
+    ox, oy, oz = vox_obj.offset
+    scaled_verts = [((lx+ox)*voxel_size, (ly+oy)*voxel_size, (lz+oz)*voxel_size) for lx,ly,lz in vertices]
+    faces = [[v-1 for v in p[0]] for p in polygons]
+    
+    mesh = bpy.data.meshes.new(vox_obj.name)
+    mesh.from_pydata(scaled_verts, [], faces)
+    
+    # Salva a cor original no próprio Mesh via atributo Face para o Baker ler
+    color_attr = mesh.attributes.new(name="vox_color", type='INT', domain='FACE')
+    for i, poly in enumerate(polygons):
+        color_attr.data[i].value = poly[2]
+        mesh.polygons[i].use_smooth = False # Hard edges
+        
+    mesh.update()
+    obj = bpy.data.objects.new(vox_obj.name, mesh)
+    bpy.context.collection.objects.link(obj)
+    return obj
+
+# ==============================================================================
+# DOMAIN 4: BAKE & MATERIAL
+# ==============================================================================
+def save_png(path, pixels, width, height):
+    def chunk(tag, data):
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack('>I', len(data)) + tag + data + struct.pack('>I', crc)
+    raw_rows = bytearray()
+    for y in range(height):
+        raw_rows.append(0)
+        raw_rows.extend(pixels[y*width*3:(y+1)*width*3])
+    png = (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', width, height, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(bytes(raw_rows), 9)) + chunk(b'IEND', b''))
+    with open(path, 'wb') as f:
+        f.write(png)
+
+def execute_bake(obj, palette, resolution, output_dir):
+    mesh = obj.data
+    if "vox_color" not in mesh.attributes:
+        return False, "Objeto não possui atributo 'vox_color'. Importe um .vox primeiro."
+
+    # Coleta cores usadas e constrói grid
+    used_colors = sorted(set(attr.value for attr in mesh.attributes["vox_color"].data))
+    n = len(used_colors)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    tw = max(4, resolution // cols)
+    th = max(4, resolution // rows)
+
+    pixels = bytearray(resolution * resolution * 3)
+    color_to_uv = {}
+
+    for fi, c_idx in enumerate(used_colors):
+        pal_idx = max(0, min(255, c_idx - 1))
+        r, g, b = palette[pal_idx][:3]
+        col, row = fi % cols, fi // cols
+        x0, y0 = col * tw, row * th
+        x1, y1 = min(resolution, x0 + tw), min(resolution, y0 + th)
+
+        for y in range(y0 + 1, y1 - 1):
+            for x in range(x0 + 1, x1 - 1):
+                idx = (y * resolution + x) * 3
+                pixels[idx], pixels[idx+1], pixels[idx+2] = r, g, b
+
+        u_c = (x0 + x1) / 2.0 / resolution
+        v_c = 1.0 - (y0 + y1) / 2.0 / resolution
+        color_to_uv[c_idx] = (u_c, v_c)
+
+    png_path = os.path.join(output_dir, f"{obj.name}_baked.png")
+    save_png(png_path, pixels, resolution, resolution)
+
+    # Criação e aplicação direta da UV
+    uv_layer = mesh.uv_layers.new(name="UVMap_baked")
+    mesh.uv_layers.active = uv_layer
+    
+    for poly in mesh.polygons:
+        c_idx = mesh.attributes["vox_color"].data[poly.index].value
+        u, v = color_to_uv[c_idx]
+        for loop_idx in poly.loop_indices:
+            uv_layer.data[loop_idx].uv = (u, v)
+
+    # Criação do Material (Flat shading preparado para Bevy)
+    img = bpy.data.images.load(png_path)
+    img.colorspace_settings.name = "sRGB"
+    mat = bpy.data.materials.new(name=f"{obj.name}_Baked")
+    mat.use_nodes = True
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+    nodes.clear()
+    
+    uv_node = nodes.new("ShaderNodeUVMap")
+    uv_node.uv_map = "UVMap_baked"
+    tex_node = nodes.new("ShaderNodeTexImage")
+    tex_node.image = img
+    tex_node.interpolation = "Closest"
+    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
+    bsdf.inputs["Metallic"].default_value = 0.0
+    bsdf.inputs["Roughness"].default_value = 1.0
+    out = nodes.new("ShaderNodeOutputMaterial")
+    
+    links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
+    links.new(tex_node.outputs["Color"], bsdf.inputs["Base Color"])
+    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+    
+    obj.data.materials.clear()
+    obj.data.materials.append(mat)
+    
+    return True, f"Bake concluído e salvo em {png_path}"
+
+# ==============================================================================
+# DOMAIN 5: UI PANEL & OPERATORS
+# ==============================================================================
+class VOX_OT_ImportOperator(bpy.types.Operator):
+    bl_idname = "vox.import"
+    bl_label = "Import .VOX"
+    bl_options = {'REGISTER', 'UNDO'}
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+
+    def execute(self, context):
+        size = context.scene.vox_settings.voxel_size
+        try:
+            scene = parse_vox_file(self.filepath)
+            context.scene.vox_settings.last_palette = str(scene.palette)
+            context.scene.vox_settings.last_import_dir = os.path.dirname(self.filepath)
+            
+            for vox_obj in scene.objects:
+                build_blender_geometry(vox_obj, size)
+                
+            self.report({'INFO'}, f"Importado com sucesso. {len(scene.objects)} malhas geradas.")
+        except Exception as e:
+            self.report({'ERROR'}, f"Erro: {str(e)}")
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+class VOX_OT_BakeOperator(bpy.types.Operator):
+    bl_idname = "vox.bake"
+    bl_label = "Bake"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        obj = context.active_object
+        if not obj or obj.type != 'MESH':
+            self.report({'WARNING'}, "Selecione um objeto Voxel.")
+            return {'CANCELLED'}
+            
+        settings = context.scene.vox_settings
+        palette = eval(settings.last_palette) if settings.last_palette else build_default_palette()
+        out_dir = settings.last_import_dir if settings.save_in_vox_folder and settings.last_import_dir else bpy.path.abspath("//")
+        
+        success, msg = execute_bake(obj, palette, settings.texture_resolution, out_dir)
+        self.report({'INFO'} if success else {'ERROR'}, msg)
+        return {'FINISHED'}
+
+class VOX_OT_ExportFBXOperator(bpy.types.Operator):
+    bl_idname = "vox.export_fbx"
+    bl_label = "Export FBX"
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="//export.fbx")
+
+    def execute(self, context):
+        bpy.ops.export_scene.fbx(
+            filepath=self.filepath,
+            use_selection=True,
+            embed_textures=True,
+            path_mode="COPY",
+            mesh_smooth_type="FACE"
+        )
+        self.report({'INFO'}, "FBX exportado com sucesso para a engine.")
+        return {'FINISHED'}
+        
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+class VoxelSettings(bpy.types.PropertyGroup):
+    texture_resolution: bpy.props.IntProperty(name="Texture Resolution", default=1024, min=64, max=4096)
+    voxel_size: bpy.props.FloatProperty(name="Voxel Size", default=1.0, precision=2) # 1.0 = Default scale for UE5 / Bevy 
+    save_in_vox_folder: bpy.props.BoolProperty(name="Save in VOX Folder", default=True)
+    last_palette: bpy.props.StringProperty()
+    last_import_dir: bpy.props.StringProperty()
+
+class VIEW3D_PT_VoxelPipelinePanel(bpy.types.Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'Sqrd Voxel Optimizer'
+    bl_label = "Sqrd Voxel Optimizer"
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.vox_settings
+
+        layout.label(text="Import", icon='IMPORT')
+        layout.operator("vox.import", text="Import .VOX")
+        layout.separator()
+
+        layout.label(text="Bake", icon='TEXTURE')
+        box = layout.box()
+        box.prop(settings, "texture_resolution")
+        box.prop(settings, "voxel_size")
+        box.prop(settings, "save_in_vox_folder")
+        layout.operator("vox.bake", text="Bake")
+        layout.separator()
+
+        layout.label(text="Export", icon='EXPORT')
+        layout.operator("vox.export_fbx", text="Export FBX")
+
+classes = (VoxelSettings, VOX_OT_ImportOperator, VOX_OT_BakeOperator, VOX_OT_ExportFBXOperator, VIEW3D_PT_VoxelPipelinePanel)
+
+def register():
+    for cls in classes: bpy.utils.register_class(cls)
+    bpy.types.Scene.vox_settings = bpy.props.PointerProperty(type=VoxelSettings)
+
+def unregister():
+    for cls in reversed(classes): bpy.utils.unregister_class(cls)
+    del bpy.types.Scene.vox_settings
+
+if __name__ == "__main__": register()
