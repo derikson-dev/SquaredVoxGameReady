@@ -1,7 +1,7 @@
 bl_info = {
     "name": "SquaredVoxelOptimizer",
     "author": "Derikson",
-    "version": (1, 1, 0),
+    "version": (1, 3, 0),
     "blender": (5, 1, 0),
     "location": "View3D > Sidebar > Sqrd Voxel Optimizer",
     "description": "Pipeline monolítico VOX -> Greedy Mesh -> Bake -> FBX. Otimizado para Bevy 0.18.",
@@ -394,7 +394,11 @@ def build_blender_geometry(vox_obj, voxel_size):
     mesh.update()
     obj = bpy.data.objects.new(vox_obj.name, mesh)
     bpy.context.collection.objects.link(obj)
-    return obj
+    
+    raw_faces_count = len(vox_obj.voxels) * 6
+    opt_faces_count = len(polygons)
+    
+    return obj, raw_faces_count, opt_faces_count
 
 # ==============================================================================
 # DOMAIN 4: BAKE & MATERIAL
@@ -486,9 +490,31 @@ def execute_bake(obj, palette, resolution, output_dir):
 # ==============================================================================
 # DOMAIN 5: UI PANEL & OPERATORS
 # ==============================================================================
+class VOX_OT_ShowReport(bpy.types.Operator):
+    bl_idname = "vox.show_report"
+    bl_label = "Optimization Report"
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        # Transforma o pop-up em um menu flutuante leve para remover os botões OK/Cancel indesejados
+        return context.window_manager.invoke_popup(self, width=400)
+
+    def draw(self, context):
+        layout = self.layout
+        report = context.scene.vox_settings.last_report
+        for line in report.split('\n'):
+            if line.startswith("Total:") or line.startswith("Geometry reduction"):
+                layout.label(text=line, icon='INFO')
+            elif line.strip() == "":
+                layout.separator()
+            else:
+                layout.label(text=line)
+
 class VOX_OT_ImportOperator(bpy.types.Operator):
     bl_idname = "vox.import"
-    bl_label = "Import .VOX"
+    bl_label = "Import and Optimize .Vox"
     bl_options = {'REGISTER', 'UNDO'}
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
 
@@ -499,10 +525,29 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
             context.scene.vox_settings.last_palette = str(scene.palette)
             context.scene.vox_settings.last_import_dir = os.path.dirname(self.filepath)
             
+            report_lines = []
+            total_raw = 0
+            total_opt = 0
+            
             for vox_obj in scene.objects:
-                build_blender_geometry(vox_obj, size)
+                obj, raw_f, opt_f = build_blender_geometry(vox_obj, size)
+                report_lines.append(f"{vox_obj.name}: {raw_f} -> {opt_f} faces")
+                total_raw += raw_f
+                total_opt += opt_f
                 
-            self.report({'INFO'}, f"Importado com sucesso. {len(scene.objects)} malhas geradas.")
+            report_str = f"Loaded objects: {len(scene.objects)}\n\n"
+            report_str += "\n".join(report_lines)
+            report_str += f"\n\nTotal: {total_raw} raw faces -> {total_opt} optimized faces."
+            if total_raw > 0:
+                report_str += f"\nGeometry reduction: {100 - (total_opt/total_raw*100):.1f}%"
+                
+            context.scene.vox_settings.last_report = report_str
+            
+            # Só chama o pop-up se o checkbox estiver ativado
+            if context.scene.vox_settings.show_optimization_report:
+                bpy.ops.vox.show_report('INVOKE_DEFAULT')
+            
+            self.report({'INFO'}, f"Successfully imported {len(scene.objects)} meshes.")
         except Exception as e:
             self.report({'ERROR'}, f"Erro: {str(e)}")
         return {'FINISHED'}
@@ -552,10 +597,12 @@ class VOX_OT_ExportFBXOperator(bpy.types.Operator):
 
 class VoxelSettings(bpy.types.PropertyGroup):
     texture_resolution: bpy.props.IntProperty(name="Texture Resolution", default=1024, min=64, max=4096)
-    voxel_size: bpy.props.FloatProperty(name="Voxel Size", default=1.0, precision=2) # 1.0 = Default scale for UE5 / Bevy 
-    save_in_vox_folder: bpy.props.BoolProperty(name="Save in VOX Folder", default=True)
+    voxel_size: bpy.props.FloatProperty(name="Voxel Size", default=1.0, precision=2) 
+    save_in_vox_folder: bpy.props.BoolProperty(name="Save in imported .vox folder", default=True)
+    show_optimization_report: bpy.props.BoolProperty(name="Show Optimization Report", default=True)
     last_palette: bpy.props.StringProperty()
     last_import_dir: bpy.props.StringProperty()
+    last_report: bpy.props.StringProperty()
 
 class VIEW3D_PT_VoxelPipelinePanel(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
@@ -568,7 +615,8 @@ class VIEW3D_PT_VoxelPipelinePanel(bpy.types.Panel):
         settings = context.scene.vox_settings
 
         layout.label(text="Import", icon='IMPORT')
-        layout.operator("vox.import", text="Import .VOX")
+        layout.prop(settings, "show_optimization_report")
+        layout.operator("vox.import", text="Import and Optimize .Vox")
         layout.separator()
 
         layout.label(text="Bake", icon='TEXTURE')
@@ -582,7 +630,14 @@ class VIEW3D_PT_VoxelPipelinePanel(bpy.types.Panel):
         layout.label(text="Export", icon='EXPORT')
         layout.operator("vox.export_fbx", text="Export FBX")
 
-classes = (VoxelSettings, VOX_OT_ImportOperator, VOX_OT_BakeOperator, VOX_OT_ExportFBXOperator, VIEW3D_PT_VoxelPipelinePanel)
+classes = (
+    VoxelSettings, 
+    VOX_OT_ShowReport, 
+    VOX_OT_ImportOperator, 
+    VOX_OT_BakeOperator, 
+    VOX_OT_ExportFBXOperator, 
+    VIEW3D_PT_VoxelPipelinePanel
+)
 
 def register():
     for cls in classes: bpy.utils.register_class(cls)
