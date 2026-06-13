@@ -1,5 +1,5 @@
 """
-setup.py — Build script for C extensions (Fase 3)
+setup.py — Build script for the C extensions.
 
 Builds two extensions:
   greedy_mesher_ext   — greedy meshing algorithm
@@ -8,17 +8,13 @@ Builds two extensions:
 Usage:
     python setup.py build_ext --inplace
 
-After building, greedy_mesher.py and greedy_obj_exporter.py
-automatically detect and use the C backends.
-
 Compiler flags:
-    -O3 -march=native    maximum speed on build machine
+    -O3 -march=native    maximum speed on the build machine
     -DNDEBUG             strip assertions
     -fvisibility=hidden  clean symbol table (Linux/macOS)
 
 Windows note:
-    MSVC is used automatically; -march=native is omitted.
-    Tested on MSVC 19.x (Visual Studio 2022).
+    MSVC is used automatically and -march=native is omitted.
 """
 import platform
 from setuptools import setup, Extension
@@ -45,7 +41,7 @@ extensions = [
 setup(
     name="vox_greedy_extensions",
     version="1.0.0",
-    description="Fase 3 C extensions for SquaredVoxGameReady",
+    description="C extensions for SquaredVoxGameReady",
     ext_modules=extensions,
     python_requires=">=3.8",
 )

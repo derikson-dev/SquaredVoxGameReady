@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "SquaredVoxelOptimizer",
+    "name": "Squared Voxel Optimizer",
     "author": "Derikson",
-    "version": (1, 5, 0),
+    "version": (1, 0, 0),
     "blender": (5, 1, 0),
-    "location": "View3D > Sidebar > Sqrd Voxel Optimizer",
-    "description": "Pipeline monolítico VOX -> Greedy Mesh -> Bake -> FBX. Otimizado para Bevy 0.18.",
+    "location": "View3D > Sidebar > Squared VOR",
+    "description": "Monolithic VOX -> Greedy Mesh -> Bake -> FBX pipeline. Optimized for Bevy 0.18.",
     "category": "Import-Export",
 }
 
@@ -13,12 +13,13 @@ import struct
 import zlib
 import math
 import os
+import tempfile
 import mathutils
 from pathlib import Path
 from collections import defaultdict
 
 # ==============================================================================
-# DOMAIN 1: EXTENSÕES C E FALLBACKS
+# DOMAIN 1: C EXTENSIONS & FALLBACKS
 # ==============================================================================
 try:
     import greedy_mesher_ext as _EXT
@@ -33,7 +34,7 @@ except ImportError:
     _HAS_TJ_C = False
 
 # ==============================================================================
-# DOMAIN 2: VOX PARSING E ESTRUTURAS
+# DOMAIN 2: VOX PARSING & STRUCTURES
 # ==============================================================================
 _DEFAULT_PALETTE_RGBA = [
     0x00000000,0xffffffff,0xffccffff,0xff99ffff,0xff66ffff,0xff33ffff,
@@ -128,7 +129,7 @@ def _decode_rotation(r_byte):
 def parse_vox_file(filepath):
     data = Path(filepath).read_bytes()
     if data[:4] != b'VOX ':
-        raise ValueError(f'Arquivo corrompido ou formato inválido: {filepath}')
+        raise ValueError(f'Corrupted file or invalid format: {filepath}')
 
     offset = 8
     main_content_sz  = struct.unpack_from('<I', data, offset+4)[0]
@@ -209,7 +210,7 @@ def parse_vox_file(filepath):
 
     obj_idx = [0]
     
-    # Extrai as transformações isolando para o Motor do Blender
+    # Extract the transforms in Blender's coordinate space
     def traverse(node_id, acc_rot, acc_tx, acc_ty, acc_tz, current_pivot=None, trn_name=''):
         if node_id not in nodes: return
         node = nodes[node_id]
@@ -222,8 +223,8 @@ def parse_vox_file(filepath):
             p_val = (node.get('px'), node.get('py'), node.get('pz'))
             next_pivot = p_val if p_val[0] is not None else current_pivot
             
-            # Mesmo metodo do add-on "MagicaVoxel VOX format": o nome do objeto
-            # vem do atributo _name do nTRN pai imediato do nSHP.
+            # Same approach as the "MagicaVoxel VOX format" add-on: the object
+            # name comes from the _name attribute of the nTRN directly above the nSHP.
             traverse(node['child'], new_rot, acc_tx+rt[0], acc_ty+rt[1], acc_tz+rt[2], next_pivot, node.get('name', ''))
             
         elif node['type'] == 'GRP':
@@ -235,10 +236,10 @@ def parse_vox_file(filepath):
             m = raw_models[mid]
             sx, sy, sz = m['size']
 
-            # Mesmo metodo do add-on "MagicaVoxel VOX format":
-            # a malha local e centralizada no pivot inteiro floor(size/2)
-            # e a transformacao acumulada (T @ R) e aplicada como matriz,
-            # sem correcoes de paridade/wobble.
+            # Same approach as the "MagicaVoxel VOX format" add-on:
+            # the local mesh is centered on the integer pivot floor(size/2)
+            # and the accumulated transform (T @ R) is applied as a matrix,
+            # with no parity/wobble corrections.
             scene.objects.append(VoxObject(
                 name=trn_name if trn_name else f'Object_{obj_idx[0]}',
                 size=(sx, sy, sz),
@@ -261,15 +262,15 @@ def _greedy_mesh_plane_python(model, axis, direction):
     if axis == "x":
         size_w, size_u, size_v = sx, sy, sz
         coord_global  = lambda u, v, w: (w, u, v)
-        coord_vizinho = lambda u, v, w: (w + direction, u, v)
+        coord_neighbor = lambda u, v, w: (w + direction, u, v)
     elif axis == "y":
         size_w, size_u, size_v = sy, sx, sz
         coord_global  = lambda u, v, w: (u, w, v)
-        coord_vizinho = lambda u, v, w: (u, w + direction, v)
+        coord_neighbor = lambda u, v, w: (u, w + direction, v)
     elif axis == "z":
         size_w, size_u, size_v = sz, sx, sy
         coord_global  = lambda u, v, w: (u, v, w)
-        coord_vizinho = lambda u, v, w: (u, v, w + direction)
+        coord_neighbor = lambda u, v, w: (u, v, w + direction)
     
     quads = []
     for w in range(size_w):
@@ -277,7 +278,7 @@ def _greedy_mesh_plane_python(model, axis, direction):
         for u in range(size_u):
             for v in range(size_v):
                 pa = coord_global(u, v, w)
-                pv = coord_vizinho(u, v, w)
+                pv = coord_neighbor(u, v, w)
                 if pa not in voxels or pv in voxels: continue
                 mask[u][v] = voxels[pa]
         used = [[False] * size_v for _ in range(size_u)]
@@ -373,11 +374,11 @@ def _resolver_python(raw_quads):
         polygons = new_polygons
     return vertices, polygons
 
-def build_blender_geometry(vox_obj, voxel_size, palette):
+def build_blender_geometry(vox_obj, voxel_size, palette, target_collection):
     sides = ['xp', 'xn', 'yp', 'yn', 'zp', 'zn']
     raw_quads = []
     
-    # Roda o algoritmo Mesher puramente no Espaço Local da Bounding Box (0 à sx)
+    # Run the mesher purely in the bounding box local space (0 to sx)
     for side in sides:
         if BACKEND == 'c_ext':
             quads = getattr(_EXT, f"greedy_mesh_{side}")(vox_obj)
@@ -394,7 +395,7 @@ def build_blender_geometry(vox_obj, voxel_size, palette):
     rot, tx, ty, tz = vox_obj.transform
     cx, cy, cz = vox_obj.pivot
     
-    # Subtrai o Centro Verdadeiro (Pivot) da Geometria Local
+    # Subtract the true center (pivot) from the local geometry
     scaled_verts = [((lx - cx) * voxel_size, (ly - cy) * voxel_size, (lz - cz) * voxel_size) for lx, ly, lz in vertices]
     faces = [[v-1 for v in p[0]] for p in polygons]
     
@@ -416,12 +417,12 @@ def build_blender_geometry(vox_obj, voxel_size, palette):
         
     mesh.update()
     obj = bpy.data.objects.new(vox_obj.name, mesh)
-    bpy.context.collection.objects.link(obj)
+    target_collection.objects.link(obj)
     
-    # Mesmo metodo do add-on "MagicaVoxel VOX format":
-    # matrix_world = Translation @ Rotation. A matriz e atribuida diretamente
-    # porque o byte _r do .vox pode codificar espelhamentos (det = -1),
-    # que rotation_euler nao consegue representar.
+    # Same approach as the "MagicaVoxel VOX format" add-on:
+    # matrix_world = Translation @ Rotation. The matrix is assigned directly
+    # because the .vox _r byte can encode mirroring (det = -1),
+    # which rotation_euler cannot represent.
     obj.matrix_world = mathutils.Matrix((
         (rot[0][0], rot[0][1], rot[0][2], tx * voxel_size),
         (rot[1][0], rot[1][1], rot[1][2], ty * voxel_size),
@@ -467,7 +468,7 @@ def save_png(path, pixels, width, height):
 def execute_bake(obj, palette, resolution, output_dir):
     mesh = obj.data
     if "vox_color" not in mesh.attributes:
-        return False, "Objeto não possui atributo 'vox_color'. Importe um .vox primeiro."
+        return False, "Object has no 'vox_color' attribute. Import a .vox first."
 
     used_colors = sorted(set(attr.value for attr in mesh.attributes["vox_color"].data))
     n = len(used_colors)
@@ -496,7 +497,12 @@ def execute_bake(obj, palette, resolution, output_dir):
         color_to_uv[c_idx] = (u_c, v_c)
 
     png_path = os.path.join(output_dir, f"{obj.name}_baked.png")
-    save_png(png_path, pixels, resolution, resolution)
+    try:
+        save_png(png_path, pixels, resolution, resolution)
+    except (PermissionError, OSError) as e:
+        return False, (f"Could not write the texture to '{png_path}'. "
+                       f"Save the .blend file in a writable folder (or enable "
+                       f"'Save in imported .vox folder') and bake again. [{e}]")
 
     uv_layer = mesh.uv_layers.new(name="UVMap_baked")
     mesh.uv_layers.active = uv_layer
@@ -531,7 +537,7 @@ def execute_bake(obj, palette, resolution, output_dir):
     obj.data.materials.clear()
     obj.data.materials.append(mat)
     
-    return True, f"Bake concluído e salvo em {png_path}"
+    return True, f"Bake finished and saved to {png_path}"
 
 # ==============================================================================
 # DOMAIN 5: UI PANEL & OPERATORS
@@ -563,23 +569,97 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
     filepath: bpy.props.StringProperty(subtype="FILE_PATH")
 
+    @staticmethod
+    def _make_active_collection(context, collection):
+        # Set the given collection as the active one in the current view layer.
+        def find(layer_coll):
+            if layer_coll.collection == collection:
+                return layer_coll
+            for child in layer_coll.children:
+                found = find(child)
+                if found:
+                    return found
+            return None
+        lc = find(context.view_layer.layer_collection)
+        if lc:
+            context.view_layer.active_layer_collection = lc
+
+    @staticmethod
+    def _recenter_to_floor(context, objects):
+        if not objects:
+            return
+        context.view_layer.update()  # ensure matrices/bounds are current
+        mn = [float('inf')] * 3
+        mx = [float('-inf')] * 3
+        for obj in objects:
+            for corner in obj.bound_box:
+                wc = obj.matrix_world @ mathutils.Vector(corner)
+                for i in range(3):
+                    if wc[i] < mn[i]: mn[i] = wc[i]
+                    if wc[i] > mx[i]: mx[i] = wc[i]
+        if mn[0] == float('inf'):
+            return
+        offset = mathutils.Vector((
+            -(mn[0] + mx[0]) / 2.0,   # center X
+            -(mn[1] + mx[1]) / 2.0,   # center Y
+            -mn[2],                   # base on the floor (Z = 0)
+        ))
+        shift = mathutils.Matrix.Translation(offset)
+        for obj in objects:
+            obj.matrix_world = shift @ obj.matrix_world
+
+    @staticmethod
+    def _select_and_frame(context, objects):
+        for o in context.view_layer.objects:
+            o.select_set(False)
+        for obj in objects:
+            obj.select_set(True)
+        if objects:
+            context.view_layer.objects.active = objects[0]
+        # Frame the selection in the first available 3D viewport.
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != 'VIEW_3D':
+                    continue
+                region = next((r for r in area.regions if r.type == 'WINDOW'), None)
+                if region:
+                    with context.temp_override(window=window, area=area, region=region):
+                        bpy.ops.view3d.view_selected()
+                    return
+
     def execute(self, context):
         size = context.scene.vox_settings.voxel_size
         try:
             scene = parse_vox_file(self.filepath)
             context.scene.vox_settings.last_palette = str(scene.palette)
             context.scene.vox_settings.last_import_dir = os.path.dirname(self.filepath)
-            
+
+            # Group every imported object under a collection named after the .vox,
+            # so objects stay tidy and "Bake without selection" can target it.
+            coll_name = os.path.splitext(os.path.basename(self.filepath))[0] or "VoxImport"
+            vox_collection = bpy.data.collections.new(coll_name)
+            context.scene.collection.children.link(vox_collection)
+            self._make_active_collection(context, vox_collection)
+
             report_lines = []
             total_raw = 0
             total_opt = 0
-            
+            created = []
+
             for vox_obj in scene.objects:
-                obj, raw_f, opt_f = build_blender_geometry(vox_obj, size, scene.palette)
+                obj, raw_f, opt_f = build_blender_geometry(vox_obj, size, scene.palette, vox_collection)
+                created.append(obj)
                 report_lines.append(f"{vox_obj.name}: {raw_f} -> {opt_f} faces")
                 total_raw += raw_f
                 total_opt += opt_f
-                
+
+            # Recenter the whole collection as a rigid block: centered on X/Y
+            # at the world origin, with its base resting on the floor (Z = 0).
+            self._recenter_to_floor(context, created)
+
+            # Select the imported objects and frame them in the viewport.
+            self._select_and_frame(context, created)
+
             report_str = f"Loaded objects: {len(scene.objects)}\n\n"
             report_str += "\n".join(report_lines)
             report_str += f"\n\nTotal: {total_raw} raw faces -> {total_opt} optimized faces."
@@ -593,7 +673,7 @@ class VOX_OT_ImportOperator(bpy.types.Operator):
             
             self.report({'INFO'}, f"Successfully imported {len(scene.objects)} meshes.")
         except Exception as e:
-            self.report({'ERROR'}, f"Erro: {str(e)}")
+            self.report({'ERROR'}, f"Error: {str(e)}")
         return {'FINISHED'}
 
     def invoke(self, context, event):
@@ -605,20 +685,70 @@ class VOX_OT_BakeOperator(bpy.types.Operator):
     bl_label = "Bake"
     bl_options = {'REGISTER', 'UNDO'}
 
-    def execute(self, context):
-        obj = context.active_object
-        if not obj or obj.type != 'MESH':
-            self.report({'WARNING'}, "Selecione um objeto Voxel.")
-            return {'CANCELLED'}
-            
+    directory: bpy.props.StringProperty(subtype="DIR_PATH", options={'HIDDEN'})
+
+    def _gather_targets(self, context):
+        # 1) Explicitly selected meshes carrying the vox_color attribute.
+        sel = [o for o in context.selected_objects
+               if o.type == 'MESH' and "vox_color" in o.data.attributes]
+        if sel:
+            return sel
+        # 2) Otherwise, every vox mesh in the active collection
+        #    (but never the Scene Collection root — that just warns).
+        coll = context.view_layer.active_layer_collection.collection
+        if coll and coll != context.scene.collection:
+            return [o for o in coll.all_objects
+                    if o.type == 'MESH' and "vox_color" in o.data.attributes]
+        return []
+
+    def invoke(self, context, event):
         settings = context.scene.vox_settings
+        # Validate the selection first, so an empty/collection selection
+        # just warns instead of opening the folder picker.
+        if not self._gather_targets(context):
+            self.report({'WARNING'}, "Select imported objects, or activate the collection imported by the add-on.")
+            return {'CANCELLED'}
+        # If the .vox folder is known and chosen, bake without asking.
+        if settings.save_in_vox_folder and settings.last_import_dir:
+            return self.execute(context)
+        # Otherwise prompt for an output folder.
+        if bpy.data.filepath:
+            self.directory = os.path.dirname(bpy.data.filepath)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        settings = context.scene.vox_settings
+        targets = self._gather_targets(context)
+        if not targets:
+            self.report({'WARNING'}, "Select imported objects, or activate the collection imported by the add-on.")
+            return {'CANCELLED'}
+
+        # Resolve a writable output directory.
+        # Priority: imported .vox folder -> chosen folder -> .blend folder -> temp.
+        if settings.save_in_vox_folder and settings.last_import_dir:
+            out_dir = settings.last_import_dir
+        elif self.directory:
+            out_dir = self.directory
+        elif bpy.data.filepath:
+            out_dir = os.path.dirname(bpy.data.filepath)
+        else:
+            out_dir = bpy.app.tempdir or tempfile.gettempdir()
+        if not os.path.isdir(out_dir):
+            out_dir = bpy.app.tempdir or tempfile.gettempdir()
+
         palette = eval(settings.last_palette) if settings.last_palette else build_default_palette()
-        out_dir = settings.last_import_dir if settings.save_in_vox_folder and settings.last_import_dir else bpy.path.abspath("//")
-        
         res = int(settings.texture_resolution)
-        
-        success, msg = execute_bake(obj, palette, res, out_dir)
-        self.report({'INFO'} if success else {'ERROR'}, msg)
+
+        baked = 0
+        for obj in targets:
+            success, msg = execute_bake(obj, palette, res, out_dir)
+            if not success:
+                self.report({'ERROR'}, msg)
+                return {'CANCELLED'}
+            baked += 1
+
+        self.report({'INFO'}, f"Baked {baked} object(s) into {out_dir}")
         return {'FINISHED'}
 
 class VOX_OT_ExportFBXOperator(bpy.types.Operator):
@@ -634,7 +764,7 @@ class VOX_OT_ExportFBXOperator(bpy.types.Operator):
             path_mode="COPY",
             mesh_smooth_type="FACE"
         )
-        self.report({'INFO'}, "FBX exportado com sucesso para a engine.")
+        self.report({'INFO'}, "FBX exported successfully for the engine.")
         return {'FINISHED'}
         
     def invoke(self, context, event):
@@ -644,13 +774,13 @@ class VOX_OT_ExportFBXOperator(bpy.types.Operator):
 class VoxelSettings(bpy.types.PropertyGroup):
     texture_resolution: bpy.props.EnumProperty(
         name="Texture Resolution",
-        description="Padrões POT (Power of 2) da Indústria",
+        description="Industry-standard POT (power of two) sizes",
         items=[
-            ('128', "128x128", "Detalhes mínimos"),
-            ('256', "256x256", "Props pequenos"),
-            ('512', "512x512", "Padrão leve"),
-            ('1024', "1024x1024 (1K)", "Padrão recomendado"),
-            ('2048', "2048x2048 (2K)", "Máximo recomendado para Voxel"),
+            ('128', "128x128", "Minimal detail"),
+            ('256', "256x256", "Small props"),
+            ('512', "512x512", "Lightweight default"),
+            ('1024', "1024x1024 (1K)", "Recommended default"),
+            ('2048', "2048x2048 (2K)", "Recommended maximum for voxels"),
         ],
         default='1024'
     )
@@ -664,8 +794,8 @@ class VoxelSettings(bpy.types.PropertyGroup):
 class VIEW3D_PT_VoxelPipelinePanel(bpy.types.Panel):
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = 'Sqrd Voxel Optimizer'
-    bl_label = "Sqrd Voxel Optimizer"
+    bl_category = 'Squared VOR'
+    bl_label = "Squared Voxel Optimizer"
 
     def draw(self, context):
         layout = self.layout

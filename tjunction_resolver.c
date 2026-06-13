@@ -1,5 +1,5 @@
 /*
- * tjunction_resolver.c  —  Fase 3: T-junction resolver in C
+ * tjunction_resolver.c — T-junction resolver in C
  *
  * Python API:
  *   resolve_tjunctions(raw_quads) -> (vertices, polygons)
@@ -7,7 +7,7 @@
  *     vertices  : list of [x,y,z]
  *     polygons  : list of ([vi0,vi1,vi2,vi3], side_int, color_int)
  *
- * Side int: xp=0 xn=1 yp=2 yn=3 zp=4 zn=5  (SIDE_MAP in greedy_obj_exporter)
+ * Side int: xp=0 xn=1 yp=2 yn=3 zp=4 zn=5
  *
  * Build:  python setup.py build_ext --inplace
  */
@@ -506,7 +506,7 @@ static PyMethodDef methods[]={
 
 static struct PyModuleDef mod={
     PyModuleDef_HEAD_INIT,"tjunction_resolver",
-    "Fase 3 C T-junction resolver for SquaredVoxGameReady.",-1,methods
+    "C T-junction resolver for SquaredVoxGameReady.",-1,methods
 };
 
 PyMODINIT_FUNC PyInit_tjunction_resolver(void){ return PyModule_Create(&mod); }

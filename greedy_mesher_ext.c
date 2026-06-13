@@ -1,15 +1,11 @@
 /*
- * greedy_mesher_ext.c  —  Fase 3: C extension for SquaredVoxGameReady
+ * greedy_mesher_ext.c — C extension for SquaredVoxGameReady
  *
- * Implements greedy_mesh_plane() in C for maximum performance.
+ * Implements greedy_mesh_plane() in C.
  *
- * Performance vs numpy path:
- *   Dense 32³  : ~3–4x   |  Dense 128³: ~8–12x
- *   Sparse/real: ~5–15x  (no numpy allocation overhead per slice)
- *
- * API (identical to greedy_mesher.py public API):
+ * Public API (mirrors greedy_mesher.py):
  *   greedy_mesh_plane(model, axis: str, direction: int) -> list[tuple]
- *   greedy_mesh_xp/xn/yp/yn/zp/zn(model) -> list[tuple]
+ *   greedy_mesh_xp/xn/yp/yn/zp/zn(model)               -> list[tuple]
  *
  * Each returned tuple: (u, v, w, width, height, color_idx)
  *
@@ -36,11 +32,10 @@ static void volume_free(Volume *v) {
 }
 
 /*
- * Build volume from model.voxels (Python list/iterable of (x,y,z,c) tuples).
+ * Build a volume from model.voxels (iterable of (x, y, z, c) tuples).
  * Returns 0 on success, -1 on error (Python exception set).
  */
 static int volume_build(Volume *vol, PyObject *model) {
-    /* Get size */
     PyObject *size_obj = PyObject_GetAttrString(model, "size");
     if (!size_obj) return -1;
     if (!PyTuple_Check(size_obj) || PyTuple_GET_SIZE(size_obj) < 3) {
@@ -62,7 +57,6 @@ static int volume_build(Volume *vol, PyObject *model) {
     vol->data = (uint8_t *)calloc(total, 1);
     if (!vol->data) { PyErr_NoMemory(); return -1; }
 
-    /* Fill from model.voxels */
     PyObject *voxels = PyObject_GetAttrString(model, "voxels");
     if (!voxels) { volume_free(vol); return -1; }
 
@@ -97,7 +91,7 @@ static int volume_build(Volume *vol, PyObject *model) {
 
 /*
  * Fill mask[size_u * size_v] for one slice.
- * mask[u * size_v + v] = color if face visible, 0 otherwise.
+ * mask[u * size_v + v] = color if the face is visible, 0 otherwise.
  */
 static void fill_mask_x(const Volume *vol, uint8_t *mask,
                          int w, int direction,
@@ -141,13 +135,12 @@ static void fill_mask_z(const Volume *vol, uint8_t *mask,
     }
 }
 
-/* ── Greedy pack (C inner loop) ──────────────────────────────────────────── */
+/* ── Greedy pack ─────────────────────────────────────────────────────────── */
 
 /*
- * Greedy pack over flat mask[size_u * size_v] (row-major).
- * Appends (u, v, width, height, color) tuples to result_list.
- * Modifies mask in-place (consumed cells → 0).
- * Returns 0 on success, -1 on error.
+ * Greedy pack over a flat mask[size_u * size_v] (row-major).
+ * Appends (u, v, w, width, height, color) tuples to result_list and
+ * clears consumed cells in place. Returns 0 on success, -1 on error.
  */
 static int greedy_pack(uint8_t *mask, int size_u, int size_v,
                        int w, PyObject *result_list) {
@@ -176,12 +169,10 @@ static int greedy_pack(uint8_t *mask, int size_u, int size_v,
                 height++;
             }
 
-            /* Zero consumed region */
             for (int du = 0; du < width; du++) {
                 memset(&mask[(u + du) * size_v + v], 0, height);
             }
 
-            /* Append result tuple (u, v, w, width, height, color) */
             PyObject *t = Py_BuildValue("(iiiiii)",
                                         u, v, w, width, height, (int)color);
             if (!t) return -1;
@@ -192,7 +183,7 @@ static int greedy_pack(uint8_t *mask, int size_u, int size_v,
     return 0;
 }
 
-/* ── Main entry: greedy_mesh_plane ──────────────────────────────────────── */
+/* ── Main entry: greedy_mesh_plane ───────────────────────────────────────── */
 
 static PyObject *
 py_greedy_mesh_plane(PyObject *self, PyObject *args) {
@@ -207,7 +198,7 @@ py_greedy_mesh_plane(PyObject *self, PyObject *args) {
     if (volume_build(&vol, model) < 0) return NULL;
 
     int size_w, size_u, size_v;
-    int axis_id;  /* 0=x, 1=y, 2=z */
+    int axis_id;  /* 0 = x, 1 = y, 2 = z */
 
     if (axis[0] == 'x' && axis[1] == '\0') {
         axis_id = 0; size_w = vol.sx; size_u = vol.sy; size_v = vol.sz;
@@ -228,14 +219,13 @@ py_greedy_mesh_plane(PyObject *self, PyObject *args) {
     if (!result) { free(mask); volume_free(&vol); return NULL; }
 
     for (int w = 0; w < size_w; w++) {
-        /* Fill mask for this slice */
         switch (axis_id) {
             case 0: fill_mask_x(&vol, mask, w, direction, size_u, size_v); break;
             case 1: fill_mask_y(&vol, mask, w, direction, size_u, size_v); break;
             case 2: fill_mask_z(&vol, mask, w, direction, size_u, size_v); break;
         }
 
-        /* Quick non-zero check before greedy */
+        /* Skip empty slices before packing */
         int any = 0;
         for (int i = 0; i < size_u * size_v && !any; i++)
             any = mask[i] != 0;
@@ -294,7 +284,7 @@ static PyMethodDef GreedyMesherMethods[] = {
 static struct PyModuleDef greedy_mesher_ext_module = {
     PyModuleDef_HEAD_INIT,
     "greedy_mesher_ext",
-    "Fase 3 — C extension for the greedy voxel mesher (SquaredVoxGameReady).",
+    "C extension for the greedy voxel mesher (SquaredVoxGameReady).",
     -1,
     GreedyMesherMethods
 };
